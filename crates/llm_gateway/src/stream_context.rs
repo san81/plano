@@ -4,13 +4,16 @@ use log::{debug, error, info, warn};
 use proxy_wasm::hostcalls::get_current_time;
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::Metrics;
-use common::configuration::{LlmProvider, LlmProviderType, Overrides};
+use common::aws_credentials::get_credentials_from_config;
+use common::aws_sigv4::{sign_request, SigV4Params};
+use common::configuration::{AwsCredentialsConfig, LlmProvider, LlmProviderType, Overrides};
 use common::consts::{
     ARCH_IS_STREAMING_HEADER, ARCH_PROVIDER_HINT_HEADER, ARCH_ROUTING_HEADER, HEALTHZ_PATH,
     RATELIMIT_SELECTOR_HEADER_KEY, REQUEST_ID_HEADER, TRACE_PARENT_HEADER,
@@ -49,6 +52,7 @@ pub struct StreamContext {
     traceparent: Option<String>,
     request_body_sent_time: Option<u128>,
     _overrides: Rc<Option<Overrides>>,
+    aws_credentials: Rc<Option<AwsCredentialsConfig>>,
     user_message: Option<String>,
     upstream_status_code: Option<StatusCode>,
     binary_frame_decoder: Option<BedrockBinaryFrameDecoder<bytes::BytesMut>>,
@@ -56,6 +60,7 @@ pub struct StreamContext {
     http_protocol: Option<String>,
     sse_buffer: Option<SseStreamBuffer>,
     sse_chunk_processor: Option<SseChunkProcessor>,
+    needs_bedrock_sigv4: bool,
 }
 
 impl StreamContext {
@@ -63,10 +68,12 @@ impl StreamContext {
         metrics: Rc<Metrics>,
         llm_providers: Rc<LlmProviders>,
         overrides: Rc<Option<Overrides>>,
+        aws_credentials: Rc<Option<AwsCredentialsConfig>>,
     ) -> Self {
         StreamContext {
             metrics,
             _overrides: overrides,
+            aws_credentials,
             ratelimit_selector: None,
             streaming_response: false,
             response_tokens: 0,
@@ -87,6 +94,7 @@ impl StreamContext {
             http_protocol: None,
             sse_buffer: None,
             sse_chunk_processor: None,
+            needs_bedrock_sigv4: false,
         }
     }
 
@@ -176,6 +184,8 @@ impl StreamContext {
     }
 
     fn modify_auth_headers(&mut self) -> Result<(), ServerError> {
+        self.needs_bedrock_sigv4 = false;
+
         if self.llm_provider().passthrough_auth == Some(true) {
             // Check if client provided an Authorization header
             if self.get_http_request_header("Authorization").is_none() {
@@ -191,6 +201,27 @@ impl StreamContext {
                 );
             }
             return Ok(());
+        }
+
+        if matches!(
+            self.resolved_api.as_ref(),
+            Some(
+                SupportedUpstreamAPIs::AmazonBedrockConverse(_)
+                    | SupportedUpstreamAPIs::AmazonBedrockConverseStream(_)
+            )
+        ) && self.aws_credentials.is_some()
+        {
+            if cfg!(feature = "aws-sigv4") {
+                self.needs_bedrock_sigv4 = true;
+                self.remove_http_request_header("Authorization");
+                self.remove_http_request_header("x-api-key");
+                return Ok(());
+            }
+
+            warn!(
+                "[PLANO_REQ_ID:{}] BEDROCK_SIGV4_DISABLED: aws_credentials configured but aws-sigv4 feature is off; falling back to bearer auth",
+                self.request_identifier()
+            );
         }
 
         let llm_provider_api_key_value =
@@ -226,6 +257,94 @@ impl StreamContext {
                 let authorization_header_value = format!("Bearer {}", llm_provider_api_key_value);
                 self.set_http_request_header("Authorization", Some(&authorization_header_value));
             }
+        }
+
+        Ok(())
+    }
+
+    fn extract_host_for_sigv4(&self) -> Result<String, ServerError> {
+        if let Some(endpoint) = self.llm_provider().endpoint.as_ref() {
+            let mut host = endpoint.as_str();
+            if let Some(stripped) = host.strip_prefix("https://") {
+                host = stripped;
+            } else if let Some(stripped) = host.strip_prefix("http://") {
+                host = stripped;
+            }
+
+            let host = host.split('/').next().unwrap_or(host);
+            return Ok(host.to_string());
+        }
+
+        self.get_http_request_header(":authority").ok_or_else(|| {
+            ServerError::BadRequest {
+                why: "Unable to determine host for SigV4 signing".to_string(),
+            }
+        })
+    }
+
+    fn sign_bedrock_request_with_sigv4(&mut self, payload: &[u8]) -> Result<(), ServerError> {
+        let creds_config = self.aws_credentials.as_ref().as_ref().ok_or_else(|| {
+            ServerError::BadRequest {
+                why: "AWS credentials not configured".to_string(),
+            }
+        })?;
+
+        let (access_key_id, secret_access_key, session_token) =
+            get_credentials_from_config(creds_config).map_err(|e| ServerError::BadRequest {
+                why: format!("Failed to load AWS credentials: {}", e),
+            })?;
+
+        let method = self
+            .get_http_request_header(":method")
+            .unwrap_or_else(|| "POST".to_string());
+        let path = self
+            .get_http_request_header(":path")
+            .unwrap_or_else(|| "/".to_string());
+
+        let (uri, query_string) = if let Some(q_pos) = path.find('?') {
+            (path[..q_pos].to_string(), path[q_pos + 1..].to_string())
+        } else {
+            (path, String::new())
+        };
+
+        let host = self.extract_host_for_sigv4()?;
+
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("host".to_string(), host);
+        if let Some(ct) = self.get_http_request_header("content-type") {
+            headers.insert("content-type".to_string(), ct);
+        }
+
+        let region = extract_region_from_host(
+            self.llm_provider()
+                .endpoint
+                .as_deref()
+                .unwrap_or(""),
+        )
+        .or_else(|| self.get_http_request_header(":authority").and_then(|h| extract_region_from_host(&h)))
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+        let (authorization, amz_date, _signature) = sign_request(SigV4Params {
+            access_key_id,
+            secret_access_key,
+            session_token: session_token.clone(),
+            region,
+            service: "bedrock-runtime".to_string(),
+            method,
+            uri,
+            query_string,
+            headers,
+            payload: payload.to_vec(),
+            signing_time: None,
+        })
+        .map_err(|e| ServerError::BadRequest {
+            why: format!("Failed to sign AWS request: {}", e),
+        })?;
+
+        self.set_http_request_header("Authorization", Some(&authorization));
+        self.set_http_request_header("x-amz-date", Some(&amz_date));
+        if let Some(token) = session_token {
+            self.set_http_request_header("x-amz-security-token", Some(&token));
         }
 
         Ok(())
@@ -767,6 +886,27 @@ impl StreamContext {
             }
         }
     }
+
+}
+
+fn extract_region_from_host(host: &str) -> Option<String> {
+    let host = host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+
+    let host = host.split('/').next().unwrap_or(host);
+    if let Some(domain) = host.strip_prefix("bedrock-runtime.") {
+        if let Some(region) = domain.strip_suffix(".amazonaws.com.cn") {
+            return Some(region.to_string());
+        }
+        if let Some(region) = domain.strip_suffix(".amazonaws.com") {
+            return Some(region.to_string());
+        }
+    }
+
+    None
 }
 
 // HttpContext is the trait that allows the Rust code to interact with HTTP objects.
@@ -1058,6 +1198,14 @@ impl HttpContext for StreamContext {
                     return Action::Pause;
                 }
             };
+
+        if self.needs_bedrock_sigv4 {
+            if let Err(e) = self.sign_bedrock_request_with_sigv4(&serialized_body_bytes_upstream)
+            {
+                self.send_server_error(e, Some(StatusCode::BAD_REQUEST));
+                return Action::Pause;
+            }
+        }
 
         self.set_http_request_body(0, body_size, &serialized_body_bytes_upstream);
         Action::Continue
